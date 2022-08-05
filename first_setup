@@ -1,0 +1,370 @@
+/*
+
+I've a flutter app and there is It's not possible to query the auth users table directly to handle an auth panel from a client. 
+Immagine that your app has a panel to manage app users.
+
+USECASE: the user can't sign up. Only the user who have the claims is_sysadmin or is_secretary can create new users and modify the table members_registry
+         so theese users create a new auth.user from client and save the new auth_id in the members_registry.user_id. This allows the trigger 
+         to update members_registry on auth.users update. there can be a situation in which members_registry or auth.users have a respectvely linked row.
+         Attention, if a user signs up by itself members_registry is not updated because there are not record with the new auth.users.it, so it's not meant 
+         to be used with users signup
+         
+pre: you need to have already a table in the public schema to hold the values elaborated, in my case it is:
+| column_name        | data_type                | character_maximum_length |
+| ------------------ | ------------------------ | ------------------------ |
+| id_member          | text                     |                          |
+| last_name          | text                     |                          |
+| first_name         | text                     |                          |
+| email              | text                     |                          |
+| birth_date         | date                     |                          |
+| municipality       | text                     |                          |
+| town_code          | text                     |                          |
+| town_name          | text                     |                          |
+| region             | text                     |                          |
+| country            | text                     |                          |
+| user_id            | uuid                     |                          |
+| email_confirmed_at | timestamp with time zone |                          |
+| last_sign_in_at    | timestamp with time zone |                          |
+| created_at         | timestamp with time zone |                          |
+| updated_at         | timestamp with time zone |                          |
+| is_anonymous       | boolean                  |                          |
+| is_member          | boolean                  |                          |
+| is_teacher         | boolean                  |                          |
+| is_secretary       | boolean                  |                          |
+| is_treasurer       | boolean                  |                          |
+| is_executivemember | boolean                  |                          |
+| is_president       | boolean                  |                          |
+| is_sysadmin        | boolean                  |                          |
+| is_enabled         | boolean                  |                          |
+| providers          | text                     |                          |
+| provider           | character varying        |                          |
+____________________________________________________________________________
+
+there are 3 sections:
+- set db_config: sets locale timezone and alter the table memebers_registry to get a foreign key to auth.users
+- set auth_functions functions to use client side, and triggers to synck members_registry
+- set custom_claims: manage custom claims
+- bootstrap: bootstrap a system admin to use client side
+
+
+the claims(roles):
+    - is_anonymous
+    - is_member
+    - is_teacher
+    - is_secretary
+    - is_treasurer
+    - is_executiveMember
+    - is_president
+    - is_sysadmin
+    - is_enabled
+So there are different roles for eache role there is a custom claim.
+Here is configured a special custom claim 'is_sysadmin' with that role the user can delete/modify/list user accounts, 
+but theese functionality are available only in a server SDK not available in dart.
+So the workaround, in place of the auth sdl, is to use a function and check the 'is_sysadmin' claim.
+This way functionalities are made available to the client.
+Remember members_registry is the public table i created in public schema, so if your public table name is different you should
+change it.
+
+there are the following functions calleble on the client side:
+  - delete_user_byId: given an auth.id checks if the invoker user has the 'is_sysadmin' claim
+                      set to true, and deletes the user from auth, while the fk user_id in members_registry is set to null by constraint
+
+  - list_users: checks if the invoker user has the 'is_sysadmin' claim and returns the auth.users table
+
+and there is a function with a trigger used to overcome the limit of auth.users table. That table is not easy to modify,
+and not possible to listen to in real time. so the idea is to synch the wanted auth data in a public listenable table:
+  - handle_upsert_user: copies the wanted values from auth.users to public.members_registry table included custom claims 
+    where the members_registry.user_id=new.id. this means that the table members_registry must have a user_id field matching 
+    the auth.id and also all the fields we want to from from the auth row
+
+  - on_auth_user_upsert: triggers handle_upsert_user. this is very interesting because it updates the members_registry table  
+                         and if you are listening to it realtime, you can see realtime you is signin in, and how many users logged in.
+                         
+
+  - on_auth_user_delete: not implemented, solved setting the members_registry.user_id as a foreign key with set null on delete. Check the config DB section.
+
+  - change_user_email: changes the user email and the trigger on_auth_user_upsert synchs with the email field in members_registry
+
+  - list_unliked_users: lists all the auth users not linked with a members_registry record
+*/
+-----------------------------------------------------------------------------
+/*
+SET DB CONFIG
+*/
+
+alter database postgres 
+set timezone to 'Europe/Rome';
+
+ALTER TABLE members_registry 
+ADD CONSTRAINT auth_users_id_fk 
+FOREIGN KEY (user_id) REFERENCES auth.users(id) 
+ON DELETE SET NULL;
+
+
+
+-----------------------------------------------------------------------------
+/*
+INSTALL AUTH FUNCTIONS
+*/
+
+
+-- function to delete user by auth.id
+CREATE OR REPLACE FUNCTION delete_user_byId(uid uuid) RETURNS "text"
+LANGUAGE "plpgsql" SECURITY DEFINER SET search_path = public
+    AS $$
+    BEGIN
+      IF NOT is_claims_admin() THEN 
+        RETURN 'error: access denied';
+      ELSE        
+        delete from auth.users where id = uid;
+        return 'OK';
+      END IF;
+      return 'error: function didn t succeed';
+    END;
+$$;
+
+CREATE OR REPLACE FUNCTION change_user_email(uid uuid, new_email text) RETURNS "text"
+LANGUAGE "plpgsql" SECURITY DEFINER SET search_path = public
+    AS $$
+    BEGIN
+      IF NOT is_claims_admin() THEN 
+        RETURN 'error: access denied';
+      ELSE
+         update auth.users        
+         set email = new_email
+         where id = uid;
+        return 'OK';
+      END IF;
+      return 'error: function didn t succeed';
+    END;
+$$;
+
+CREATE OR REPLACE FUNCTION list_users() RETURNS setof auth.users
+    LANGUAGE "plpgsql" SECURITY DEFINER SET search_path = public
+    AS $$
+    BEGIN
+      IF NOT is_claims_admin() THEN
+          return query select '"error":"access denied"';--RETURN '{"error":"access denied"}'::jsonb;
+      ELSE
+        return query select * from auth.users;
+      END IF;
+    END;
+$$;
+
+CREATE OR REPLACE FUNCTION list_unlinked_auth_users() RETURNS setof auth.users
+    LANGUAGE "plpgsql" SECURITY DEFINER SET search_path = public
+    AS $$
+    BEGIN
+      IF NOT is_claims_admin() THEN
+          return query select '"error":"access denied"';--RETURN '{"error":"access denied"}'::jsonb;
+      ELSE
+        return query select * from auth.users where auth.users.id not in (select user_id from members_registry where user_id is not null);
+      END IF;
+    END;
+$$;
+
+
+create or replace function public.handle_upsert_user() returns trigger 
+LANGUAGE "plpgsql" SECURITY DEFINER SET search_path = public
+as $$
+begin
+   update public.members_registry 
+    set
+      email=new.email,
+      email_confirmed_at=new.email_confirmed_at, 
+      last_sign_in_at= new.last_sign_in_at, 
+      created_at=new.created_at, 
+      updated_at=new.updated_at,
+      is_anonymous=coalesce(new.raw_app_meta_data->>'is_anonymous', 'false')::bool, 
+      is_member=coalesce(new.raw_app_meta_data->>'is_member', 'false')::bool,
+      is_teacher=coalesce(new.raw_app_meta_data->>'is_teacher', 'false')::bool, 
+      is_secretary=coalesce(new.raw_app_meta_data->>'is_secretary', 'false')::bool, 
+      is_treasurer=coalesce(new.raw_app_meta_data->>'is_treasurer', 'false')::bool, 
+      is_executiveMember=coalesce(new.raw_app_meta_data->>'is_executivemember', 'false')::bool, 
+      is_president=coalesce(new.raw_app_meta_data->>'is_president', 'false')::bool, 
+      is_sysadmin=coalesce(new.raw_app_meta_data->>'is_sysadmin', 'false')::bool,	 
+      is_enabled=coalesce(new.raw_app_meta_data->>'is_enabled', 'false')::bool, 
+      providers=(new.raw_app_meta_data->>'providers'),	
+      provider=(new.raw_app_meta_data->>'provider')
+    where user_id=new.id;
+
+
+  --raise notice  'JOBDONE'; --raise notice  'date  : %; ',my_row.date;     
+  --return 'ok';
+    return new;
+end;
+$$;
+
+DROP TRIGGER IF EXISTS on_auth_user_upsert   ON auth.users;
+create trigger on_auth_user_upsert
+  after insert or update on auth.users
+  for each row execute procedure public.handle_upsert_user();
+
+
+
+
+
+/* 
+-- First developped to avoid null values in cucstom claims jason
+-- No needed because in handle_upsert_user is used the coalesce which update members_registy
+-- field to false in case of null
+create or replace function public.default_claims_new_user() returns trigger  
+LANGUAGE "plpgsql" SECURITY DEFINER SET search_path = public
+    as $$
+      begin
+        new.raw_app_meta_data = new.raw_app_meta_data ||
+             '{"is_anonymous": "false", 
+               "is_member" : "false",
+               "is_teacher" : "false",
+               "is_secretary" : "false",
+               "is_treasurer" : "false",
+               "is_executiveMember" : "false",
+               "is_president" : "false",
+               "is_sysadmin" : "false",
+               "is_enabled" : "false" }' ;
+        raise notice 'contenuto di raw_app_meta_data : %; ', new.raw_app_meta_data;    
+        return new;
+    end;
+$$;
+
+-- trigger the function every time a user is created
+DROP TRIGGER IF EXISTS on_auth_user_created_default_claims
+  ON auth.users;
+create trigger on_auth_user_created_default_claims
+  before insert on auth.users
+  for each row execute procedure public.default_claims_new_user();
+
+*/
+
+-----------------------------------------------------------------------------
+/*
+INSTALL CUSTOM CLAIMS
+this is based on https://github.com/supabase-community/supabase-custom-claims
+*/ 
+
+
+CREATE OR REPLACE FUNCTION is_claims_admin() RETURNS "bool"
+  LANGUAGE "plpgsql" 
+  AS $$
+  BEGIN
+    IF session_user = 'authenticator' THEN
+      --------------------------------------------
+      -- To disallow any authenticated app users
+      -- from editing claims, delete the following
+      -- block of code and replace it with:
+      -- RETURN FALSE;
+      --------------------------------------------
+      IF extract(epoch from now()) > coalesce((current_setting('request.jwt.claims', true)::jsonb)->>'exp', '0')::numeric THEN
+        return false; -- jwt expired
+      END IF; 
+      IF coalesce((current_setting('request.jwt.claims', true)::jsonb)->'app_metadata'->'is_sysadmin', 'false')::bool THEN
+        return true; -- user has isSysAdmin set to true
+      ELSE
+        return false; -- user does NOT have claims_admin set to true
+      END IF;
+      --------------------------------------------
+      -- End of block 
+      --------------------------------------------
+    ELSE -- not a user session, probably being called from a trigger or something
+      return true;
+    END IF;
+  END;
+$$;
+
+CREATE OR REPLACE FUNCTION get_my_claims() RETURNS "jsonb"
+    LANGUAGE "sql" STABLE
+    AS $$
+  select 
+  	coalesce(nullif(current_setting('request.jwt.claims', true), '')::jsonb -> 'app_metadata', '{}'::jsonb)::jsonb
+$$;
+CREATE OR REPLACE FUNCTION get_my_claim(claim TEXT) RETURNS "jsonb"
+    LANGUAGE "sql" STABLE
+    AS $$
+  select 
+  	coalesce(nullif(current_setting('request.jwt.claims', true), '')::jsonb -> 'app_metadata' -> claim, null)
+$$;
+
+CREATE OR REPLACE FUNCTION get_claims(uid uuid) RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER SET search_path = public
+    AS $$
+    DECLARE retval jsonb;
+    BEGIN
+      IF NOT is_claims_admin() THEN
+          RETURN '{"error":"access denied"}'::jsonb;
+      ELSE
+        select raw_app_meta_data from auth.users into retval where id = uid::uuid;
+        return retval;
+      END IF;
+    END;
+$$;
+
+CREATE OR REPLACE FUNCTION get_claim(uid uuid, claim text) RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER SET search_path = public
+    AS $$
+    DECLARE retval jsonb;
+    BEGIN
+      IF NOT is_claims_admin() THEN
+          RETURN '{"error":"access denied"}'::jsonb;
+      ELSE
+        select coalesce(raw_app_meta_data->claim, null) from auth.users into retval where id = uid::uuid;
+        return retval;
+      END IF;
+    END;
+$$;
+
+CREATE OR REPLACE FUNCTION set_claim(uid uuid, claim text, value jsonb) RETURNS "text"
+    LANGUAGE "plpgsql" SECURITY DEFINER SET search_path = public
+    AS $$
+    BEGIN
+      IF NOT is_claims_admin() THEN
+          RETURN 'error: access denied';
+      ELSE        
+        update auth.users set raw_app_meta_data = 
+          raw_app_meta_data || 
+            json_build_object(claim, value)::jsonb where id = uid;
+        return 'OK';
+      END IF;
+    END;
+$$;
+
+CREATE OR REPLACE FUNCTION set_claims(uid uuid, claims jsonb) RETURNS "text"
+    LANGUAGE "plpgsql" SECURITY DEFINER SET search_path = public
+    AS $$
+    BEGIN
+      IF NOT is_claims_admin() THEN
+          RETURN 'error: access denied';
+      ELSE        
+        update auth.users set raw_app_meta_data = 
+          raw_app_meta_data || 
+            claims where id = uid;
+        return 'OK';
+      END IF;
+    END;
+$$;
+
+CREATE OR REPLACE FUNCTION delete_claim(uid uuid, claim text) RETURNS "text"
+    LANGUAGE "plpgsql" SECURITY DEFINER SET search_path = public
+    AS $$
+    BEGIN
+      IF NOT is_claims_admin() THEN
+          RETURN 'error: access denied';
+      ELSE        
+        update auth.users set raw_app_meta_data = 
+          raw_app_meta_data - claim where id = uid;
+        return 'OK';
+      END IF;
+    END;
+$$;
+
+-----------------------------------------------------------------------------
+/*
+BOOTSTRAP
+*/ 
+
+-- Bootstrap a user who has the rights to manage auth.users table. 
+-- Change the id with the one of the user you want to administrate
+select set_claim('54e15c0e-1e86-4660-adaf-4bc17581a491', 'isSysAdmin', 'true');
+
+-----------------------------------------------------------------------------
+NOTIFY pgrst, 'reload schema';
+
